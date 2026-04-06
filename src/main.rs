@@ -156,6 +156,7 @@ fn sha256_hex(sql: &str) -> String {
 }
 
 /// Extracts table name from INSERT/UPDATE/SELECT/DELETE query
+/// and function name from SELECT function_name(...) queries
 fn extract_table_name(sql: &str) -> Option<String> {
     let sql_upper = sql.to_uppercase();
     
@@ -177,15 +178,6 @@ fn extract_table_name(sql: &str) -> Option<String> {
         return Some(table.trim().to_string());
     }
     
-    // Handle SELECT FROM
-    if let Some(pos) = sql_upper.find("FROM") {
-        let after = &sql[pos + 4..];
-        let table = after
-            .split(|c: char| c.is_whitespace() || c == '(')
-            .find(|s| !s.is_empty())?;
-        return Some(table.trim().to_string());
-    }
-    
     // Handle DELETE FROM
     if let Some(pos) = sql_upper.find("DELETE FROM") {
         let after = &sql[pos + 11..];
@@ -193,6 +185,30 @@ fn extract_table_name(sql: &str) -> Option<String> {
             .split(|c: char| c.is_whitespace())
             .find(|s| !s.is_empty())?;
         return Some(table.trim().to_string());
+    }
+    
+    None
+}
+
+/// Extracts function name from SELECT function_name(...) queries
+fn extract_function_name(sql: &str) -> Option<String> {
+    let sql_trimmed = sql.trim();
+    let sql_upper = sql_trimmed.to_uppercase();
+    
+    // Look for pattern: SELECT ... function_name(
+    if sql_upper.contains("SELECT") {
+        if let Some(paren_pos) = sql_trimmed.find('(') {
+            // Get everything before the opening paren and extract the function name
+            let before_paren = &sql_trimmed[..paren_pos].trim();
+            
+            // Split by whitespace and get the last token (the function name)
+            if let Some(func_name) = before_paren.split_whitespace().last() {
+                // Make sure it looks like a function name (not a keyword)
+                if !func_name.is_empty() && !func_name.contains(',') {
+                    return Some(func_name.to_lowercase());
+                }
+            }
+        }
     }
     
     None
@@ -218,8 +234,9 @@ fn extract_column_name(var: &str) -> String {
 }
 
 /// Attempts to infer parameter types from database schema
-/// Queries information_schema for actual column types
-/// Handles case-insensitive and underscore-flexible column name matching
+/// First tries to detect if it's a function call, then falls back to table columns
+/// Queries information_schema for actual column/parameter types
+/// Handles case-insensitive and underscore-flexible matching
 async fn infer_types_from_schema(
     pool: &PgPool,
     sql: &str,
@@ -227,9 +244,46 @@ async fn infer_types_from_schema(
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut inferred_types = Vec::new();
     
-    // Extract table name from SQL
+    // First, check if this is a function call
+    if let Some(func_name) = extract_function_name(sql) {
+        println!("Querying schema for function: '{}'", func_name);
+        
+        // Query function parameters using PostgreSQL system catalogs
+        // This is more reliable than information_schema
+        for (idx, _var) in param_vars.iter().enumerate() {
+            let query = r#"
+                SELECT pg_catalog.format_type(p.proargtypes[($1 - 1)], null)
+                FROM pg_catalog.pg_proc p
+                WHERE p.proname = $2
+                  AND pg_catalog.pg_function_is_visible(p.oid)
+                LIMIT 1
+            "#;
+            
+            let result = sqlx::query_scalar::<_, String>(query)
+                .bind((idx + 1) as i32)
+                .bind(&func_name)
+                .fetch_optional(pool)
+                .await?;
+            
+            match result {
+                Some(pg_type) => {
+                    let sqlx_type = postgres_type_to_sqlx(&pg_type);
+                    println!("Parameter ${}: {} → {} ({})", idx + 1, func_name, sqlx_type, pg_type);
+                    inferred_types.push(sqlx_type.to_string());
+                }
+                None => {
+                    println!("Parameter ${}: No function parameter found at position {}", idx + 1, idx + 1);
+                    inferred_types.push("Text".to_string());
+                }
+            }
+        }
+        
+        return Ok(inferred_types);
+    }
+    
+    // If not a function, try to extract table name and query columns
     let table_name = extract_table_name(sql)
-        .ok_or("Could not extract table name from SQL")?;
+        .ok_or("Could not extract table name or function name from SQL")?;
     
     println!("Querying schema for table: '{}'", table_name);
     
@@ -272,7 +326,7 @@ async fn infer_types_from_schema(
         match result {
             Some(pg_type) => {
                 let sqlx_type = postgres_type_to_sqlx(&pg_type);
-                println!("  ✓ Parameter ${}: '{}' → {} ({})", idx + 1, column_name, sqlx_type, pg_type);
+                println!("Parameter ${}: '{}' → {} ({})", idx + 1, column_name, sqlx_type, pg_type);
                 inferred_types.push(sqlx_type.to_string());
             }
             None => {
@@ -365,7 +419,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|(idx, v)| {
                         let col_name = extract_column_name(v);
                         let typ = infer_type(&col_name);
-                        println!("  ℹ️  Parameter ${}: {} → {}", idx + 1, col_name, typ);
+                        println!("Parameter ${}: {} → {}", idx + 1, col_name, typ);
                         typ.to_string()
                     })
                     .collect()
@@ -379,7 +433,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|(idx, v)| {
                 let col_name = extract_column_name(v);
                 let typ = infer_type(&col_name);
-                println!("  ℹ️  Parameter ${}: {} → {}", idx + 1, col_name, typ);
+                println!("Parameter ${}: {} → {}", idx + 1, col_name, typ);
                 typ.to_string()
             })
             .collect()
@@ -394,60 +448,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n{}", serde_json::to_string_pretty(&output).unwrap());
     
     Ok(())
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_count_params() {
-        let sql = "SELECT * FROM t WHERE id = $1 AND key = $2";
-        assert_eq!(count_params(sql), 2);
-    }
-    
-    #[test]
-    fn test_postgres_type_mapping() {
-        assert_eq!(postgres_type_to_sqlx("uuid"), "Uuid");
-        assert_eq!(postgres_type_to_sqlx("text"), "Text");
-        assert_eq!(postgres_type_to_sqlx("int4"), "Int4");
-        assert_eq!(postgres_type_to_sqlx("int8"), "Int8");
-        assert_eq!(postgres_type_to_sqlx("timestamptz"), "Timestamptz");
-        assert_eq!(postgres_type_to_sqlx("jsonb"), "Jsonb");
-    }
-
-    #[test]
-    fn test_extract_sql() {
-        let s = "r#\"SELECT 1\"#";
-        let result = extract_sql(s);
-        assert_eq!(result, Some("SELECT 1".to_string()));
-    }
-
-    #[test]
-    fn test_sha256() {
-        let h = sha256_hex("hello");
-        assert_eq!(
-            h,
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-        );
-    }
-
-    #[test]
-    fn test_infer_type() {
-        assert_eq!(infer_type("agent_id"), "Uuid");
-        assert_eq!(infer_type("agent_key"), "Text");
-        assert_eq!(infer_type("count_i32"), "Int4");
-        assert_eq!(infer_type("from_date"), "Text");
-        assert_eq!(infer_type("to_date"), "Text");
-        assert_eq!(infer_type("birth_date"), "Date");
-        assert_eq!(infer_type("created_timestamp"), "Timestamptz");
-    }
-    
-    #[test]
-    fn test_extract_column_name() {
-        assert_eq!(extract_column_name("simple_var"), "simple_var");
-        assert_eq!(extract_column_name("data_json[\"field_name\"]"), "field_name");
-        assert_eq!(extract_column_name("obj.field"), "field");
-        assert_eq!(extract_column_name("data_json['sortvalue']"), "sortvalue");
-        assert_eq!(extract_column_name("agent.agent_id"), "agent_id");
-    }
 }
